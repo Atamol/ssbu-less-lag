@@ -11,25 +11,25 @@ use crate::sequencing;
  * class such that
  * ```
  * class SwapchainDispatches {
- *      RenderDispatchThread*   pThreads[2];
- *      nvn::Queue*             pQueue;
- *      RenderDispatches*       pDispatchNow;
- *      RenderDispatches*       pDispatchNext;
+ * RenderDispatchThread* pThreads[2];
+ * nvn::Queue* pQueue;
+ * RenderDispatches* pDispatchNow;
+ * RenderDispatches* pDispatchNext;
  *
- *      void SubmitDispatch(RenderDispatches* next) {
- *          pDispatchNext = next;
- *      }
+ * void SubmitDispatch(RenderDispatches* next) {
+ * pDispatchNext = next;
+ * }
  *
- *      void AwaitAndSubmitDispatches() {
- *          if (pDispatchNow != nullptr) {
- *              RenderDispatchThread* pThread = this->pThreads[pDispatchNow->ThreadId];
- *              while (pThread->CurrentBatch != pThread->BatchEnd) { std::this_thread::yield(); } // Awaits render dispatch thread to finish
- *              pDispatchNow->SubmitToQueue(pQueue);
- *          } else {
- *              pDispatchNow = pDispatchNext;
- *              pDispatchNext = nullptr;
- *          }
- *      }
+ * void AwaitAndSubmitDispatches() {
+ * if (pDispatchNow != nullptr) {
+ * RenderDispatchThread* pThread = this->pThreads[pDispatchNow->ThreadId];
+ * while (pThread->CurrentBatch != pThread->BatchEnd) { std::this_thread::yield(); } // Awaits render dispatch thread to finish
+ * pDispatchNow->SubmitToQueue(pQueue);
+ * } else {
+ * pDispatchNow = pDispatchNext;
+ * pDispatchNext = nullptr;
+ * }
+ * }
  * };
  * ```
  *
@@ -42,29 +42,29 @@ use crate::sequencing;
  *
  * ```
  * void MainLoop() {
- *      while (true) {
- *          PresentAndAcquireNextTexture();
- *          pSwapchain->AwaitAndSubmitDispatches();
- *          UpdateTaskWorker(s_EffectManager);          // Submits effect subsystem render commands to dispatcher
- *          UpdateTaskWorker(s_UiManager);              // Submits ui subsystem render commands to dispatcher
- *          UpdatetaskWorker(s_BattleObjectManager);    // Submits battle object render commands to dispatcher
- *          SignalRenderDispatchBegin();                // Signals that render dispatch threads can begin processing their submitted tasks
- *          PollInputs();                               // Polls user inputs
- *          RunScene();                                 // Runs core game state update (updates UI, battles, everything)
- *          if (s_FramePacer->ShouldRunAgain()) {       // Checks if we are running behind, then runs the scene again
- *              PollInputs();
- *              RunScene();
- *          }
- *      }
+ * while (true) {
+ * PresentAndAcquireNextTexture();
+ * pSwapchain->AwaitAndSubmitDispatches();
+ * UpdateTaskWorker(s_EffectManager);          // Submits effect subsystem render commands to dispatcher
+ * UpdateTaskWorker(s_UiManager);              // Submits ui subsystem render commands to dispatcher
+ * UpdatetaskWorker(s_BattleObjectManager);    // Submits battle object render commands to dispatcher
+ * SignalRenderDispatchBegin();                // Signals that render dispatch threads can begin processing their submitted tasks
+ * PollInputs();                               // Polls user inputs
+ * RunScene();                                 // Runs core game state update (updates UI, battles, everything)
+ * if (s_FramePacer->ShouldRunAgain()) {       // Checks if we are running behind, then runs the scene again
+ * PollInputs();
+ * RunScene();
+ * }
+ * }
  * }
  * ```
  * In this grossly oversimplified representation of the main loop, there are two concerning choices:
  * 1. We are polling inputs and running the scene update *after* the current state is rendered. That means that
- *      when the frame is presented that is being rendered on any given invocation of the loop, it's going to represent the
- *      state that the last frame finished with.
+ * when the frame is presented that is being rendered on any given invocation of the loop, it's going to represent the
+ * state that the last frame finished with.
  * 2. Our frame pacer is just running a second frame without special casing input handling (such as by using timestamps)
- *      which means that sometimes, randomly, we will get a frame that has 1 frame less input lag. In practice, it's worse than that
- *      because you might think you have a 3 frame window for an input but you actually have a 2 frame window for an input.
+ * which means that sometimes, randomly, we will get a frame that has 1 frame less input lag. In practice, it's worse than that
+ * because you might think you have a 3 frame window for an input but you actually have a 2 frame window for an input.
  *
  * Another, more subtle, problem is the implementation of `PresentAndAcquireNextTexture`. Because we have to call it twice before it actually
  * takes the path of processing a render dispatch, we have 2 frames of input lag. You might also realize that the texture index we acquire
@@ -169,7 +169,9 @@ fn use_current_frame_index() {
 
 #[skyline::hook(offset = 0x386ab4c, inline)]
 fn use_next_frame_index(ctx: &mut skyline::hooks::InlineCtx) {
-    ctx.registers[9].set_x((ctx.registers[9].x() + 1) % 2);
+    // Changed modulo from 2 to 3 to restore the native triple buffering behavior,
+    // which prevents CPU starvation and online lag during heavy effects.
+    ctx.registers[9].set_x((ctx.registers[9].x() + 1) % 3);
 }
 
 /** This disables a sync that is signaled by rendering wrapping up
@@ -185,14 +187,17 @@ fn patch_render_sync_wait() {
         .unwrap();
 }
 
-#[skyline::hook(offset = 0x38601f8, inline)]
-unsafe fn set_num_window_textures(ctx: &skyline::hooks::InlineCtx) {
-    let func_ptr = *skyline::hooks::getRegionAddress(skyline::hooks::Region::Text)
-        .cast::<u8>()
-        .add(0x593fb80)
-        .cast::<extern "C" fn(u64, i32)>();
-    func_ptr(*((ctx.registers[23].x() + 0x10) as *const u64), 2);
-}
+// Commented out the hook that restricts the number of window textures to 2.
+// This allows the game to use its native 3 buffers (triple buffering),
+// preventing the game logic/CPU from freezing when the GPU takes too long.
+// #[skyline::hook(offset = 0x38601f8, inline)]
+// unsafe fn set_num_window_textures(ctx: &skyline::hooks::InlineCtx) {
+//     let func_ptr = *skyline::hooks::getRegionAddress(skyline::hooks::Region::Text)
+//         .cast::<u8>()
+//         .add(0x593fb80)
+//         .cast::<extern "C" fn(u64, i32)>();
+//     func_ptr(*((ctx.registers[23].x() + 0x10) as *const u64), 2);
+// }
 
 pub fn install(is_vsync_disabled: bool) {
     // patch_swap_flush_call();
@@ -205,7 +210,8 @@ pub fn install(is_vsync_disabled: bool) {
     skyline::install_hooks!(
         // flush_swap_buffers_before_present,
         full_swapchain_flush,
-        use_next_frame_index,
-        set_num_window_textures
+        use_next_frame_index
+        // Commented out set_num_window_textures hook installation
+        // set_num_window_textures
     );
 }
